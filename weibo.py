@@ -1,257 +1,483 @@
+import time
+import requests
 import json
 import re
-import requests
-from requests.adapters import HTTPAdapter
 import os
 import sys
+from urllib.parse import urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
-headers = {
-    'User_Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-}
+class Config:
+    def __init__(self, uid = None, cookie= None, save_dir=None):
+        # 验证UID是否为数字
+        if not str(uid).isdigit():
+            raise ValueError("UID 必须为纯数字!")
+        self.uid = uid
+        
+        # 验证Cookie是否非空
+        if not cookie.strip():
+            raise ValueError("Cookie 不能为空!")
+        self.cookie = cookie
+        
+        # 设置保存路径，默认为当前目录下的weibo_download
+        if save_dir is None:
+            self.save_dir = os.path.join(os.getcwd(), "weibo_download")
+        else:
+            self.save_dir = save_dir
+    
+    def get_uid(self):
+        """返回已验证的UID"""
+        return self.uid
+    
+    def get_cookie(self):
+        """返回已验证的Cookie"""
+        return self.cookie
+    
+    def get_save_dir(self):
+        """返回保存路径"""
+        return self.save_dir
 
-cookies = [
-    'XSRF-TOKEN=df6_295NgzFvJXS5Ebir3Lsy; SUB=_2AkMSoQfrf8NxqwFRmfsVyG3mbYp3wgjEieKk_fYwJRMxHRl-yT9vqlIAtRB6OSEpBFcGiARBOAnwKhC5ZrKPs-0Tb0Qo; SUBP=0033WrSXqPxfM72-Ws9jqgMF55529P9D9WWFg0fG6cq3oE2bqhsoAldV; WBPSESS=gJ7ElPMf_3q2cdj5JUfmvGVqkHB92RE2_AwewsrjYWIBFCA1ZPKYgsEdwAzm6brHYlW5B6maWDy-hBEgLCyxVoJJry48tUmcvk0HOSyHP_39vQbgHUQVhjsEpRu0qJLNziegtrfv2J4r-EEdKdga-YSfVBhzDTG8azkZAaaS7Pw=',
-    'XSRF-TOKEN=df6_295NgzFvJXS5Ebir3Lsy; _s_tentry=-; Apache=6386009078674.588.1711119828939; SINAGLOBAL=6386009078674.588.1711119828939; ULV=1711119828990:1:1:1:6386009078674.588.1711119828939:; ALF=1713761012; SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9WWuyTE2R_nVVR8Gh5or-UwK5JpX5KzhUgL.FoeNeKM4eh2pehe2dJLoIEBLxK-LBozLB-BLxKBLB.2L1K2LxKqL1KMLB.2LxKqL1-eL1hnt; SUB=_2A25I-vXPDeRhGeVJ6lUY8C_Nyz-IHXVodncHrDV8PUJbn9AGLRfgkW1NT-K3eh5dPZM9ZF7BK1xxHGc5IPJnHuMf; PC_TOKEN=f7723f2711; WBPSESS=HRGrvUX5o6Tu2aaaIhJAc5AQgyd_ChArhzxpTq2G3firFqV8woflsEY-USPTjze-BoOqGxKWzJs_RNqUxg8KLzjyZVqLaIkbmQaoOqD2zfduwsrQg_Im_Rf7wmjlKZHFecpsx1yYhPLc5CTwHO7KuQ==',
-]
+class FileManager:
+    @staticmethod
+    def append_date(file_path, date_str):
+        """追加日期字符串到指定文件"""
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(date_str + "\n")
+    @staticmethod
+    def append_url(file_path, url):
+        """追加 URL 到指定文件"""
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(url + "\n")
+    @staticmethod
+    def update_unsaved_file(file_path, unsaved_set):
+        """用未保存的 URL 集合覆盖文件"""
+        with open(file_path, "w", encoding="utf-8") as f:
+            for url in unsaved_set:
+                f.write(url + "\n")
+    # 新增：读取文件中的 URL 列表并返回集合
+    @staticmethod
+    def read_urls(file_path):
+        """读取文件中的 URL 列表，返回集合"""
+        if not os.path.exists(file_path):
+            return set()
+        with open(file_path, "r", encoding="utf-8") as f:
+            return set(line.strip() for line in f if line.strip())
 
-def extract_redirected_link(short_link):
-    try:
-        response = requests.get(short_link, headers=headers, allow_redirects=False)
-        if response.status_code == 200:
-            for key, value in response.__dict__.items():
-                print(f"{key}: {value}")
+
+    @staticmethod
+    def update_unsaved_file(file_path, unsaved_set):
+        """用未保存的 URL 集合覆盖文件"""
+        with open(file_path, "w", encoding="utf-8") as f:
+            for url in unsaved_set:
+                f.write(url + "\n")
+
+class WeiboUtils:
+    @staticmethod
+    def clean_content(content):
+        """清理HTML内容并保留25个字符"""
+        str_length = 25
+        # 移除HTML标签
+        content = re.sub(r'<[^>]+>', '', content)
+        # 替换换行和回车
+        content = re.sub(r'[\n\r]', ' ', content)
+        # 保留有效字符
+        cleaned = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9_\s-]', '', content)
+        # 压缩空白字符并去除首尾空格
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        # 截取前25个字符并确保去除末尾空格
+        return cleaned[:str_length].rstrip()
+
+    @staticmethod
+    def clean_filename(name):
+        """移除文件名中的无效字符"""
+        return re.sub(r'[\\/*?:"<>|【】！]', '', name).strip()
+
+    @staticmethod
+    def get_publish_time(response):
+        """解析并格式化发布时间"""
+        try:
+            created_at_str = response.get('created_at', '')
+            dt = datetime.strptime(created_at_str, '%a %b %d %H:%M:%S %z %Y')
+            return dt.strftime('%Y-%m-%d-%H-%M-%S')
+        except Exception as e:
+            print(f"时间解析失败: {e}，使用当前时间替代")
+            return datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+
+    @staticmethod
+    def extract_redirected_link(short_link):
+        """从短链接提取重定向 URL"""
+        try:
+            response = requests.get(short_link, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}, allow_redirects=False)
+            if response.status_code == 302 and 'Location' in response.headers:
+                return response.headers['Location']
             return None
-        elif response.status_code == 302:
-            # Extract the redirection URL from the Location header
-            if 'Location' in response.headers:
-                final_url = response.headers['Location']
-                return final_url
+        except Exception as e:
+            print(f"解析短链接失败: {e}")
+            return None
+
+    @staticmethod
+    def get_page_id(url):
+        """从微博 URL 提取页面 ID"""
+        if "t.cn" in url:
+            url = WeiboUtils.extract_redirected_link(url)
+        pattern = re.compile(r'https?://weibo.com/(\d+)/(\w+)')
+        match = pattern.match(url)
+        return match.group(2) if match else None
+
+class WeiboURLFetcher:
+    def __init__(self, uid, cookie, base_dir, interval=3):
+        self.uid = uid
+        self.cookie = cookie
+        self.interval = interval
+        self.base_dir = base_dir
+        self.username_cache = {}
+        self.session = requests.Session()
+        #更新Session的headers而不是直接操作Session .headers
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Cookie': self.cookie if self.cookie else ''# 避免None导致的异常
+        })
+        self.containerid = None
+        self.username = None
+        self.download_dir = None
+        self.update_for_uid(uid)
+
+    def get_username(self, uid):
+        """通过微博 API 获取用户昵称，支持缓存"""
+        if uid in self.username_cache:
+            return self.username_cache[uid]
+        url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={uid}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+            "Cookie": self.cookie
+        }
+        try:
+            time.sleep(3)
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                username = data.get('data', {}).get('userInfo', {}).get('screen_name', f"用户_{uid}")
+                self.username_cache[uid] = username
+                return username
             else:
-                print("Error: Redirection URL not found in response headers.")
-                return None
-        else:
-            print(f"Error: Unable to access {short_link}. Status code: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"Error: {e}")
+                print(f"API 请求失败，状态码: {response.status_code}")
+        except Exception as e:
+            print(f"获取用户名异常: {e}")
+        return f"用户_{uid}"
+
+    def get_download_dir(self, base_dir, uid):
+        """获取或创建下载目录，基于用户名和 UID"""
+        for subdir in os.listdir(base_dir):
+            subdir_path = os.path.join(base_dir, subdir)
+            if os.path.isdir(subdir_path):
+                parts = subdir.rsplit('_', 1)
+                if len(parts) == 2 and parts[1] == uid:
+                    self.username_cache[uid] = parts[0]
+                    print(f'检测到现有 UID 文件夹: "{subdir}"，跳过 API 获取用户名')
+                    return subdir_path
+        username = self.get_username(uid)
+        new_folder_name = f"{username}_{uid}"
+        new_folder_path = os.path.join(base_dir, new_folder_name)
+        os.makedirs(new_folder_path, exist_ok=True)
+        print(f"创建新文件夹: {new_folder_path}")
+        return new_folder_path
+
+    def update_for_uid(self, uid):
+        """更新当前处理的 UID 相关属性"""
+        self.uid = uid
+        self.download_dir = self.get_download_dir(self.base_dir, uid)
+        self.username = self.get_username(uid)
+
+    def _get_containerid(self):
+        profile_url = f"https://m.weibo.cn/api/container/getIndex?type=uid&value={self.uid}"
+        try:
+            response = self.session.get(profile_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                for tab in data.get('data', {}).get('tabsInfo', {}).get('tabs', []):
+                    if tab.get('tab_type') == 'weibo':
+                        return tab.get('containerid')
+        except Exception as e:
+            print(f"获取 containerid 失败: {str(e)}")
         return None
-    
-def get_page_id(url):
-    # 匹配UID和页面ID的正则表达式
-    if "t.cn" in url:
-        url = extract_redirected_link(url)
 
-    pattern = re.compile(r'https?://weibo.com/(\d+)/?(\w+)?')
-    
-    # 尝试匹配链接中的UID和页面ID
-    match = pattern.match(url)
-    if match:
-        uid = match.group(1)
-        if match.group(2):
-            page_id = match.group(2)
-        else:
-            # 如果页面ID没有在链接中指定，则默认为最后一个字符
-            page_id = url[-1]
-        return page_id
-    
-    # 如果链接格式不正确，则返回None
-    return None
+    def _parse_weibo_url(self, card):
+        if card.get('card_type') != 9 or not card.get('mblog'):
+            return None
+        mblog = card['mblog']
+        user_id = mblog.get('user', {}).get('id')
+        bid = mblog.get('bid')
+        if user_id and bid:
+            return f"https://weibo.com/{user_id}/{bid}"
+        return None
 
-def weibo_pagesource(page_id):
+    def get_all_urls(self):
+        """生成器，按页面返回 URL 列表"""
+        self.containerid = self._get_containerid()
+        if not self.containerid:
+            print("无法获取 containerid，请检查 UID 和 Cookie")
+            return
+        page = 1
+        while True:
+            try:
+                api_url = f"https://m.weibo.cn/api/container/getIndex?containerid={self.containerid}&page={page}"
+                response = self.session.get(api_url, timeout=15)
+                if response.status_code != 200:
+                    print(f"请求失败，状态码：{response.status_code}")
+                    break
+                data = response.json()
+                cards = data.get('data', {}).get('cards', [])
+                page_urls = [self._parse_weibo_url(card) for card in cards if self._parse_weibo_url(card)]
+                if not page_urls:
+                    break
+                yield page_urls
+                print(f"第 {page} 页获取到 {len(page_urls)} 条 URL")
+                page += 1
+                time.sleep(self.interval)
+            except Exception as e:
+                print(f"获取第 {page} 页数据异常: {str(e)}")
+                break
+class WeiboDownloader:
+    def __init__(self, uid, cookie, base_dir):
+        """初始化 WeiboDownloader 类
+        
+        Args:
+            uid (str): 用户ID，用于记录下载失败的媒体
+            cookie (str): 用于请求微博API的cookie
+            base_dir (str): 下载文件的基础目录
+        """
+        self.uid = uid
+        self.cookie = cookie
+        self.base_dir = base_dir
+        self.headers = {
+            'User_Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        }
 
-    headers_copy = headers.copy()
-    
-    for cookie in cookies:
-        headers_copy['Cookie'] = cookie
-        request_link = "https://weibo.com/ajax/statuses/show?id=" + page_id
+    def get_page_id(self, url):
+        """从URL中提取页面ID"""
+        if "t.cn" in url:
+            url = self.extract_redirected_link(url)
+        pattern = re.compile(r'https?://weibo.com/(\d+)/?(\w+)?')
+        match = pattern.match(url)
+        if match:
+            return match.group(2) or url[-1]
+        return None
 
-        response = requests.get(request_link, headers=headers_copy)
+    def extract_redirected_link(self, short_link):
+        """解析短链接获取真实URL"""
+        try:
+            response = requests.get(short_link, headers=self.headers, allow_redirects=False)
+            if response.status_code == 302:
+                return response.headers.get('Location')
+            else:
+                print(f"Error: Unable to access {short_link}. Status code: {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"Error: {e}")
+            return None
+
+    def weibo_pagesource(self, page_id):
+        """请求微博API获取页面内容"""
+        headers_copy = self.headers.copy()
+        headers_copy['Cookie'] = self.cookie
+        response = requests.get(f"https://weibo.com/ajax/statuses/show?id={page_id}", headers=headers_copy)
         if response.ok:
             try:
-                data = response.json()
-                return data
+                return response.json()
             except ValueError:
                 print("Failed to decode JSON. Response was:", response.text)
-        elif response.status_code == 400:
-            print("Request failed with status code 400. Trying next cookie.")
-            continue
         else:
             print("Request failed with status code:", response.status_code)
-            return ""
+        return ""
 
-    print("All cookies failed. Unable to retrieve data.")
-    return ""
+    def get_publish_time(self, response):
+        """解析发布时间"""
+        try:
+            created_at_str = response.get('created_at', '')
+            if not created_at_str:
+                raise ValueError("No created_at field in response")
+            dt = datetime.strptime(created_at_str, '%a %b %d %H:%M:%S %z %Y')
+            return dt.strftime('%Y-%m-%d_%H-%M-%S')
+        except Exception as e:
+            print(f"时间解析失败: {e}，使用当前时间替代")
+            return datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-def get_page_type(response):
-    page_type = ''
-    if 'mix_media_info' in response.keys():
-        page_type = 'multimedia'
-    elif 'pic_infos' in response.keys() and 'pic_ids' in response.keys() and 'pic_num' in response.keys():
-        page_type = 'images'
-    # Note: Some picture weibo also has the 'page_info' field, e.g., https://weibo.com/2687932353/O594VFGac
-    elif 'page_info' in response.keys() and 'media_info' in response['page_info'].keys():
-        page_type = 'video'
-    else:
-        page_type = 'Unknown'
+    def get_page_type(self, response):
+        """判断页面类型（多媒体、图片、视频等）"""
+        if 'mix_media_info' in response:
+            return 'multimedia'
+        elif 'pic_infos' in response and 'pic_ids' in response and 'pic_num' in response:
+            return 'images'
+        elif 'page_info' in response and 'media_info' in response['page_info']:
+            return 'video'
+        return 'Unknown'
 
-    return page_type
+    def get_pic_type(self, response, pic_id):
+        """获取图片类型"""
+        return response['pic_infos'][pic_id]['type']
 
-def get_pic_type(response, pic_id):
-    # type:
-    #       pic: photo
-    #       livephoto: live photo
+    def get_media_urls(self, response, page_type):
+        """提取媒体URL"""
+        media_urls = []
+        if page_type == 'multimedia':
+            for media in response['mix_media_info']['items']:
+                if media['type'] == 'pic':
+                    media_urls.append({'url': media['data']['largest']['url'],
+                                      'media_id': media['data']['pic_id'],
+                                      'media_type': 'pic'})
+                elif media['type'] == 'video':
+                    video_url = media['data']['media_info']['mp4_720p_mp4'] or media['data']['media_info']['stream_url_hd']
+                    media_urls.append({'url': video_url,
+                                      'media_id': media['data']['media_info']['media_id'],
+                                      'media_type': 'video'})
+        elif page_type == 'video':
+            video_info = response['page_info']['media_info']
+            video_url = video_info['playback_list'][0]['play_info']['url'] or video_info['mp4_720p_mp4'] or video_info['stream_url_hd']
+            media_urls.append({'url': video_url,
+                              'media_id': video_info['media_id'],
+                              'media_type': 'video'})
+        elif page_type == 'images':
+            for pic_id in response['pic_ids']:
+                pic_type = self.get_pic_type(response, pic_id)
+                if pic_type == "pic":
+                    media_urls.append({'url': response['pic_infos'][pic_id]['largest']['url'],
+                                      'media_id': pic_id,
+                                      'media_type': 'pic'})
+                elif pic_type == "livephoto":
+                    media_urls.append({'url': response['pic_infos'][pic_id]['video'],
+                                      'media_id': pic_id,
+                                      'media_type': 'livephoto'})
+        return media_urls
 
-    media_type = response['pic_infos'][pic_id]['type']
-    return media_type
+    def clean_filename(self, name):
+        """清理文件名中的非法字符"""
+        return re.sub(r'[\\/*?:"<>|]', '', name).strip()
 
-
-def get_media_urls(response, page_type):
-
-    media_urls = []
-
-    if page_type == 'multimedia': 
-        num_medias = len(response['mix_media_info']['items'])
-        for i in range(num_medias):
-            media = response['mix_media_info']['items'][i]
-            if 'pic' == media['type']:
-                media_urls += [{'url': media['data']['largest']['url'],
-                                'media_id': media['data']['pic_id'],
-                                'media_type': 'pic'}]
-            elif 'video' == media['type']:
-                video_url = media['data']['media_info']['mp4_720p_mp4'] or \
-                            media['data']['media_info']['stream_url_hd']
-
-                media_urls += [{'url': video_url, 
-                                'media_id': media['data']['media_info']['media_id'],
-                                'media_type': 'video'}]
-            else:
-                print('unknown media type in multi-media page...')
-         
-    elif page_type == 'video':
-        video_info = response['page_info']['media_info']
-
-        video_url = video_info['playback_list'][0]['play_info']['url'] or \
-               video_info['mp4_720p_mp4'] or \
-               video_info['stream_url_hd']
-        
-        media_urls += [{'url': video_url,
-                        'media_id':  video_info['media_id'],
-                        'media_type': 'video'}]
-
-    elif page_type == 'images':
-        pic_ids = response['pic_ids']
-        # Note: 如果是转发微博，那么会有多个 pic_ids，其中当前微博的 pic_ids 是空，而被转发微博的 pic_ids 正常。
-        for pic_id in pic_ids: 
-            pic_type = get_pic_type(response, pic_id)
-            if pic_type == "pic":
-                media_urls += [{'url': response['pic_infos'][pic_id]['largest']['url'],
-                                'media_id': pic_id,
-                                'media_type': 'pic'}]
-            elif (pic_type == "livephoto"):
-                media_urls += [{'url': response['pic_infos'][pic_id]['video'],
-                                'media_id': pic_id,
-                                'media_type': 'livephoto'}]
-    else:
-        print("No urls catched for new type of weibo_page.")
-
-    return media_urls
-
-
-def get_user_info(response):
-    user = {}
-    user['screen_name'] = response['user']['screen_name']
-    user['uid'] = str(response['user']['id'])
-    
-    return user
-
-def download_media(url, file_path, uid):
-    downloader_headers = {
-        'User_Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Referer': 'https://weibo.com/',
-        'Sec_Fetch_Site': 'cross-site',
-        'Cookie': 'XSRF-TOKEN=df6_295NgzFvJXS5Ebir3Lsy; SUB=_2AkMSoQfrf8NxqwFRmfsVyG3mbYp3wgjEieKk_fYwJRMxHRl-yT9vqlIAtRB6OSEpBFcGiARBOAnwKhC5ZrKPs-0Tb0Qo; SUBP=0033WrSXqPxfM72-Ws9jqgMF55529P9D9WWFg0fG6cq3oE2bqhsoAldV; WBPSESS=gJ7ElPMf_3q2cdj5JUfmvGVqkHB92RE2_AwewsrjYWIBFCA1ZPKYgsEdwAzm6brHYlW5B6maWDy-hBEgLCyxVoJJry48tUmcvk0HOSyHP_39vQbgHUQVhjsEpRu0qJLNziegtrfv2J4r-EEdKdga-YSfVBhzDTG8azkZAaaS7Pw=; _s_tentry=-; Apache=6386009078674.588.1711119828939; SINAGLOBAL=6386009078674.588.1711119828939; ULV=1711119828990:1:1:1:6386009078674.588.1711119828939:',
-    }
-    try:
-        file_exist = os.path.isfile(file_path)
-        need_download = (not file_exist)
-        if not need_download:
-            return 
-        s = requests.Session()
-        s.mount(url, HTTPAdapter(max_retries=5))
-        try_count = 0
-        success = False
-        MAX_TRY_COUNT = 3
-        while try_count < MAX_TRY_COUNT:
-            downloaded = s.get(
-                #url, headers=downloader_headers, timeout=(5, 10), verify=False
-                url, headers=downloader_headers, timeout=(5, 10)
-            )
-            try_count += 1
-            fail_flg_1 = url.endswith(("jpg", "jpeg")) and not downloaded.content.endswith(b"\xff\xd9")
-            fail_flg_2 = url.endswith("png") and not downloaded.content.endswith(b"\xaeB`\x82")
-            fail_flg_3 = url.endswith("mov") and False # to do: Verify mov file status
-            fail_flg_4 = url.endswith(",video") and False
-            if ( fail_flg_1  or fail_flg_2 or fail_flg_3 or fail_flg_4):
-#                 logger.debug("[DEBUG] failed " + url + "  " + str(try_count))
-                print("[DEBUG] Download failed ")
-            else:
-                success = True
-#                 logger.debug("[DEBUG] success " + url + "  " + str(try_count))
-                print("[DEBUG] success ")
-                break
-        if success: 
-            if not file_exist:
+    def download_media(self, url, file_path):
+        """下载单个媒体文件"""
+        downloader_headers = {
+            'User_Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Referer': 'https://weibo.com/',
+            'Sec_Fetch_Site': 'cross-site',
+            'Cookie': self.cookie,
+        }
+        try:
+            if os.path.isfile(file_path):
+                return
+            s = requests.Session()
+            s.mount(url, HTTPAdapter(max_retries=5))
+            for _ in range(3):
+                downloaded = s.get(url, headers=downloader_headers, timeout=(5, 10))
+                if (url.endswith(("jpg", "jpeg")) and not downloaded.content.endswith(b"\xff\xd9")) \
+                    or (url.endswith("png") and not downloaded.content.endswith(b"\xaeB`\x82")):
+                    continue
                 with open(file_path, "wb") as f:
                     f.write(downloaded.content)
-#                     logger.debug("[DEBUG] save " + file_path )
-                    print("saved")
-        else:
-#             logger.debug("[DEBUG] failed " + url + " TOTALLY")
-            print("[DEBUG] Save failed " )
-    except Exception as e:
-        error_file = "not_downloaded.txt"
-        with open(error_file, "ab") as f:
-            url = str(uid) + ":" + file_path + ":" + url + "\n"
-            f.write(url.encode(sys.stdout.encoding))
-#         logger.exception(e)
+                    return
+        except Exception as e:
+            with open(os.path.join(self.base_dir, "not_downloaded.txt"), "ab") as f:
+                f.write(f"{self.uid}:{file_path}:{url}\n".encode(sys.stdout.encoding))
+
+    def download_url(self, url):
+        print("Downloading URL: ", url)
+        try:
+            page_id = self.get_page_id(url)
+            if not page_id:
+                print("无法获取页面ID")
+                return False
+
+            response = self.weibo_pagesource(page_id)
+            if not response:
+                print("无法获取页面内容")
+                return False
+
+            # 处理内容和文件名
+            publish_time = self.get_publish_time(response)
+            content = response.get('text', '')
+            content = re.sub(r'<[^>]+>', '', content)  # 移除HTML标签
+            cleaned_content = re.sub(r'\s+', ' ', content.replace('\n', ' ')).strip()
+            short_content = self.clean_filename(cleaned_content[:20].rstrip())
+            folder_name = f"{publish_time}_{short_content}"
+            save_path = os.path.join(self.base_dir, folder_name)
+            os.makedirs(save_path, exist_ok=True)
+
+            # 保存内容到 content.txt
+            with open(os.path.join(save_path, 'content.txt'), 'w', encoding='utf-8') as f:
+                f.write(f"URL: {url}\n内容: {cleaned_content}\n")
+
+            # 下载媒体文件
+            media_urls = self.get_media_urls(response, self.get_page_type(response))
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = [executor.submit(self.download_media,
+                                        media['url'],
+                                        os.path.join(save_path, f"{media['media_id']}.{'jpg' if media['media_type'] == 'pic' else 'mp4' if media['media_type'] == 'video' else 'mov'}"))
+                        for media in media_urls]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(f'下载异常: {exc}')
+                        raise exc  # 抛出异常以便在外部捕获
+
+            print(f"下载完成，文件保存在: {save_path}")
+            return True  # 所有媒体下载成功
+
+        except Exception as e:
+            # 记录错误信息到 error.log
+            error_log_path = os.path.join(self.base_dir, "error.log")
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            error_message = f"[{timestamp}] URL: {url} - Error: {str(e)}\n"
+            with open(error_log_path, "a", encoding="utf-8") as f:
+                f.write(error_message)
+            print(f"下载失败: {url}，错误信息已记录到 {error_log_path}")
+            return False
 
 
-def weibo_image_download(url, save_folder="images"):
-    print("Downloading URL: ", url)
+class OperationMenu:
+    def __init__(self, config):
+        self.config = config
 
-    page_id = get_page_id(url)
-    response = weibo_pagesource(page_id)
+    def run(self):
+        uid = self.config.get_uid()
+        cookie = self.config.get_cookie()
+        save_dir = self.config.get_save_dir()
+        os.makedirs(save_dir, exist_ok=True)
 
-    user_info = get_user_info(response)
-    user_folder = user_info['screen_name'] + "_" + user_info['uid']
-    save_folder = os.path.join(save_folder, user_folder)
-    if not os.path.isdir(save_folder):
-        os.makedirs(save_folder)
+        fetcher = WeiboURLFetcher(uid=uid, cookie=cookie, base_dir=save_dir)
 
-    page_type = get_page_type(response)
-    media_urls = get_media_urls(response, page_type)
+        # 加载 saved_urls.log 和 unsaved_urls.log 到集合
+        saved_urls_path = os.path.join(fetcher.download_dir, "saved_urls.log")
+        unsaved_urls_path = os.path.join(fetcher.download_dir, "unsaved_urls.log")
+        saved_set = FileManager.read_urls(saved_urls_path)
+        unsaved_set = FileManager.read_urls(unsaved_urls_path)
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = []
-        for media in media_urls:
-            media_url = media['url']
-            media_type = media['media_type']
-            media_id = media['media_id']
-            if 'pic' == media_type:
-                save_name = os.path.join(save_folder, media_id + '.jpg')
-            elif 'video' == media_type:
-                save_name = os.path.join(save_folder, media_id + '.mp4')
-            elif 'livephoto' == media_type:
-                save_name = os.path.join(save_folder, media_id + '.mov')
+        # 优先处理 unsaved_urls.log 中的 URL
+        if unsaved_set:
+            print("\n正在处理未保存的 URL...")
+            for url in list(unsaved_set):
+                print(f"\n正在下载: {url}")
+                downloader = WeiboDownloader(uid, cookie, fetcher.download_dir)  # 使用 uid 而不是 url
+                if downloader.download_url(url):  # 调用 download_url 方法
+                    unsaved_set.remove(url)  # 下载成功，从 unsaved_set 移除
+                    saved_set.add(url)       # 添加到 saved_set
+                time.sleep(1)
 
-            future = executor.submit(download_media, media_url, save_name, user_info['uid'])
-            futures.append(future)
+        print("\n正在获取用户所有微博 URL...")
+        for page_urls in fetcher.get_all_urls():
+            for url in page_urls:
+                if url not in saved_set and url not in unsaved_set:
+                    print(f"\n正在下载: {url}")
+                    downloader = WeiboDownloader(uid, cookie, fetcher.download_dir)  # 使用 uid 而不是 url
+                    if downloader.download_url(url):  # 调用 download_url 方法
+                        saved_set.add(url)    # 下载成功，添加到 saved_set
+                    else:
+                        unsaved_set.add(url)  # 下载失败，添加到 unsaved_set
+                    time.sleep(1)
 
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:
-                print('There was an exception: %s' % exc)
+        # 更新 unsaved_urls.log
+        FileManager.update_unsaved_file(unsaved_urls_path, unsaved_set)
 
-    print("Finished downloading user: ", user_info['screen_name'])
+        print("\n所有微博内容下载完成！保存路径:", os.path.abspath(fetcher.download_dir))
