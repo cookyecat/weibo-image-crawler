@@ -1,3 +1,5 @@
+
+
 # weibo-image-crawler
 
 从一条特定的微博中下载所有的高清大图、livephoto 动图、高清视频。
@@ -46,3 +48,5 @@ python main.py -f links.txt
 ```
 python main.py -f links.txt -s images
 ```
+
+文件实际会保存到指定目录下的微博作者名_UID 子目录中。
